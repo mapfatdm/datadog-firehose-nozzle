@@ -23,9 +23,10 @@ type AuthTokenFetcher interface {
 }
 
 type LoggregatorClient struct {
-	RLPGatewayClient *loggregator.RLPGatewayClient
-	stopConsumer     context.CancelFunc
-	shardId          string
+	RLPGatewayClient      *loggregator.RLPGatewayClient
+	stopConsumer          context.CancelFunc
+	shardId               string
+	enableApplicationLogs bool
 }
 
 type rlpGatewayClientDoer struct {
@@ -102,35 +103,45 @@ func NewLoggregatorClient(cfg *config.Config, lgr *gosteno.Logger, authTokenFetc
 				newRLPGatewayClientDoer(cfg.DisableAccessControl, authTokenFetcher, cfg.InsecureSSLSkipVerify),
 			),
 		),
-		shardId:      cfg.FirehoseSubscriptionID,
-		stopConsumer: nil,
+		shardId:               cfg.FirehoseSubscriptionID,
+		stopConsumer:          nil,
+		enableApplicationLogs: cfg.EnableApplicationLogs,
 	}, nil
 }
 
 func (l *LoggregatorClient) EnvelopeStream() loggregator.EnvelopeStream {
 	ctx := context.Background()
 	ctx, l.stopConsumer = context.WithCancel(context.Background())
+
+	selectors := []*loggregator_v2.Selector{
+		{
+			Message: &loggregator_v2.Selector_Counter{
+				Counter: &loggregator_v2.CounterSelector{},
+			},
+		},
+		{
+			Message: &loggregator_v2.Selector_Gauge{
+				Gauge: &loggregator_v2.GaugeSelector{},
+			},
+		},
+	}
+	// Only subscribe to the Log selector if application logs are actually
+	// forwarded (see ProcessLog in internal/nozzle/workers.go). Otherwise the
+	// nozzle asks the RLP gateway for a stream it discards anyway, crowding
+	// out Counter/Gauge envelopes in the RLP's fixed per-consumer buffer.
+	if l.enableApplicationLogs {
+		selectors = append(selectors, &loggregator_v2.Selector{
+			Message: &loggregator_v2.Selector_Log{
+				Log: &loggregator_v2.LogSelector{},
+			},
+		})
+	}
+
 	es := l.RLPGatewayClient.Stream(
 		ctx,
 		&loggregator_v2.EgressBatchRequest{
-			ShardId: l.shardId,
-			Selectors: []*loggregator_v2.Selector{
-				{
-					Message: &loggregator_v2.Selector_Counter{
-						Counter: &loggregator_v2.CounterSelector{},
-					},
-				},
-				{
-					Message: &loggregator_v2.Selector_Gauge{
-						Gauge: &loggregator_v2.GaugeSelector{},
-					},
-				},
-				{
-					Message: &loggregator_v2.Selector_Log{
-						Log: &loggregator_v2.LogSelector{},
-					},
-				},
-			},
+			ShardId:   l.shardId,
+			Selectors: selectors,
 		},
 	)
 
