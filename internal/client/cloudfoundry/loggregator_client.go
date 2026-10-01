@@ -34,6 +34,7 @@ type rlpGatewayClientDoer struct {
 	disableACS   bool
 	tokenFetcher AuthTokenFetcher
 	client       *http.Client
+	idleTimeout  time.Duration
 }
 
 func (d *rlpGatewayClientDoer) Do(req *http.Request) (*http.Response, error) {
@@ -50,7 +51,7 @@ func (d *rlpGatewayClientDoer) Do(req *http.Request) (*http.Response, error) {
 	// If token is bad, try to refresh token and retry request once but only if access
 	// control is enabled
 	if d.disableACS {
-		return resp, err
+		return d.wrapIdleTimeout(resp), err
 	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
@@ -65,10 +66,50 @@ func (d *rlpGatewayClientDoer) Do(req *http.Request) (*http.Response, error) {
 		resp, err = d.client.Do(req)
 	}
 
-	return resp, err
+	return d.wrapIdleTimeout(resp), err
 }
 
-func newRLPGatewayClientDoer(disableACS bool, tokenFetcher AuthTokenFetcher, insecureSkipVerify bool) *rlpGatewayClientDoer {
+// wrapIdleTimeout closes the stream's body if no data arrives for the
+// configured idle timeout, so the caller's read loop errors out and
+// reconnects the same way it would on any other connection failure.
+// http.Client.Timeout can't express this since it bounds the whole
+// request, but /v2/read is meant to be read indefinitely.
+func (d *rlpGatewayClientDoer) wrapIdleTimeout(resp *http.Response) *http.Response {
+	if resp == nil || resp.Body == nil || d.idleTimeout <= 0 {
+		return resp
+	}
+	resp.Body = newIdleTimeoutReadCloser(resp.Body, d.idleTimeout)
+	return resp
+}
+
+type idleTimeoutReadCloser struct {
+	io.ReadCloser
+	timeout time.Duration
+	timer   *time.Timer
+}
+
+func newIdleTimeoutReadCloser(rc io.ReadCloser, timeout time.Duration) *idleTimeoutReadCloser {
+	return &idleTimeoutReadCloser{
+		ReadCloser: rc,
+		timeout:    timeout,
+		timer:      time.AfterFunc(timeout, func() { rc.Close() }),
+	}
+}
+
+func (irc *idleTimeoutReadCloser) Read(p []byte) (int, error) {
+	n, err := irc.ReadCloser.Read(p)
+	if err == nil {
+		irc.timer.Reset(irc.timeout)
+	}
+	return n, err
+}
+
+func (irc *idleTimeoutReadCloser) Close() error {
+	irc.timer.Stop()
+	return irc.ReadCloser.Close()
+}
+
+func newRLPGatewayClientDoer(disableACS bool, tokenFetcher AuthTokenFetcher, insecureSkipVerify bool, idleTimeout time.Duration) *rlpGatewayClientDoer {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil // internal CF traffic, don't honor HTTP_PROXY/HTTPS_PROXY
 	transport.TLSClientConfig = &tls.Config{
@@ -85,6 +126,7 @@ func newRLPGatewayClientDoer(disableACS bool, tokenFetcher AuthTokenFetcher, ins
 		disableACS:   disableACS,
 		tokenFetcher: tokenFetcher,
 		client:       client,
+		idleTimeout:  idleTimeout,
 	}
 }
 
@@ -99,13 +141,15 @@ func NewLoggregatorClient(cfg *config.Config, lgr *gosteno.Logger, authTokenFetc
 		return nil, fmt.Errorf("neither CloudControllerEndpoint nor RLPGatewayURL specified, can't determine log stream URL")
 	}
 
+	idleTimeout := time.Duration(cfg.IdleTimeoutSeconds) * time.Second
+
 	logForwarder := *logger.NewRLPLogForwarder(lgr)
 	return &LoggregatorClient{
 		RLPGatewayClient: loggregator.NewRLPGatewayClient(
 			logStreamURL,
 			loggregator.WithRLPGatewayClientLogger(log.New(logForwarder, "", log.LstdFlags)),
 			loggregator.WithRLPGatewayHTTPClient(
-				newRLPGatewayClientDoer(cfg.DisableAccessControl, authTokenFetcher, cfg.InsecureSSLSkipVerify),
+				newRLPGatewayClientDoer(cfg.DisableAccessControl, authTokenFetcher, cfg.InsecureSSLSkipVerify, idleTimeout),
 			),
 		),
 		shardId:      cfg.FirehoseSubscriptionID,
