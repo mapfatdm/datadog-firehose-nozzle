@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -40,7 +41,6 @@ func (d *rlpGatewayClientDoer) Do(req *http.Request) (*http.Response, error) {
 		d.token = d.tokenFetcher.FetchAuthToken()
 	}
 
-	req.Close = true
 	req.Header.Set("Authorization", d.token)
 	resp, err := d.client.Do(req)
 	if err != nil {
@@ -54,6 +54,10 @@ func (d *rlpGatewayClientDoer) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
+		// drain so the transport can put this connection back in the pool
+		io.Copy(io.Discard, resp.Body) //nolint:errcheck
+		resp.Body.Close()
+
 		time.Sleep(200 * time.Millisecond)
 		d.token = d.tokenFetcher.FetchAuthToken()
 
@@ -65,13 +69,15 @@ func (d *rlpGatewayClientDoer) Do(req *http.Request) (*http.Response, error) {
 }
 
 func newRLPGatewayClientDoer(disableACS bool, tokenFetcher AuthTokenFetcher, insecureSkipVerify bool) *rlpGatewayClientDoer {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil // internal CF traffic, don't honor HTTP_PROXY/HTTPS_PROXY
+	transport.TLSClientConfig = &tls.Config{
+		InsecureSkipVerify: insecureSkipVerify,
+	}
+	transport.ResponseHeaderTimeout = 30 * time.Second
+
 	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: insecureSkipVerify,
-			},
-		},
-		Timeout: 1 * time.Minute,
+		Transport: transport,
 	}
 
 	return &rlpGatewayClientDoer{
